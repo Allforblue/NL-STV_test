@@ -25,7 +25,7 @@ class ExecutionResult:
 
 class CodeExecutor:
     def __init__(self):
-        # 定义允许在 exec 环境中使用的库 (白名单机制建议在未来加强)
+        # 定义允许在 exec 环境中使用的库
         self.global_context = {
             "pd": pd,
             "gpd": gpd,
@@ -36,7 +36,7 @@ class CodeExecutor:
 
     def _clean_code(self, code: str) -> str:
         """
-        清洗代码字符串，移除 Markdown 标记 (```python ... ```)
+        清洗代码字符串，移除 Markdown 标记
         """
         code = code.strip()
         if code.startswith("```python"):
@@ -48,110 +48,110 @@ class CodeExecutor:
             code = code[:-3]
         return code.strip()
 
-    def execute(self, code_str: str, df: Any) -> ExecutionResult:
+    def execute(self, code_str: str, data_context: Dict[str, Any]) -> ExecutionResult:
         """
-        执行代码的核心方法。
-
         Args:
-            code_str: Python 代码字符串
-            df: 当前的数据集 (DataFrame 或 GeoDataFrame)，将以变量名 'df' 注入环境
-
-        Returns:
-            ExecutionResult 对象
+            code_str: Python 代码
+            data_context: 变量名到 DataFrame 的映射字典
+                          例如 {'df_trips': df1, 'df_zones': df2}
         """
-        # 1. 清洗代码
         clean_code = self._clean_code(code_str)
 
-        # 2. 准备执行上下文 (Local Scope)
-        # 我们强制约定：数据变量名为 'df'
-        local_scope = {"df": df}
+        # [修改点]: 直接复制传入的字典作为局部作用域
+        # 这样 AI 代码里就可以直接引用 data_context 中的 key (变量名)
+        local_scope = data_context.copy()
 
-        # 3. 捕获标准输出 (可选，用于调试 print 语句)
         old_stdout = sys.stdout
         redirected_output = io.StringIO()
         sys.stdout = redirected_output
 
         try:
-            logger.info("Executing code snippet...")
-            # --- 核心执行 ---
-            # exec() 在 global_context (库) 和 local_scope (数据) 中运行
+            logger.info(f"Executing code snippet with context keys: {list(data_context.keys())}")
+
+            # exec 在 global_context (库) 和 local_scope (数据变量) 中运行
             exec(clean_code, self.global_context, local_scope)
-            # --------------
 
-            sys.stdout = old_stdout  # 还原 stdout
+            sys.stdout = old_stdout
 
-            # 4. 提取结果
-            # 我们强制约定：AI 生成的代码必须将图表赋值给变量 'fig'
+            # 检查结果变量 'fig'
             if "fig" in local_scope:
-                fig_obj = local_scope["fig"]
-                return ExecutionResult(success=True, result=fig_obj, code=clean_code)
+                return ExecutionResult(success=True, result=local_scope["fig"], code=clean_code)
             else:
                 return ExecutionResult(
                     success=False,
-                    error="Code executed successfully, but no variable named 'fig' was generated.",
+                    error="Code executed successfully, but no 'fig' variable was assigned.",
                     code=clean_code
                 )
 
         except Exception:
-            sys.stdout = old_stdout  # 确保出错也能还原 stdout
-
-            # 5. 捕获详细的错误堆栈
-            # 这是实现 Self-Healing 的关键，我们需要把这个报错回传给 AI
+            sys.stdout = old_stdout
             error_trace = traceback.format_exc()
-            logger.error(f"Execution failed:\n{error_trace}")
-
             return ExecutionResult(success=False, error=error_trace, code=clean_code)
 
 
 # --- 单元测试 ---
 if __name__ == "__main__":
-    print("=== Testing Code Executor ===")
+    print("=== Testing Code Executor (Multi-Context Support) ===")
 
-    # 1. 创建模拟数据
-    data = {
-        "category": ["A", "B", "C", "A", "B"],
-        "value": [10, 20, 15, 25, 30],
-        "lat": [40.71, 40.72, 40.73, 40.74, 40.75],
-        "lon": [-74.00, -74.01, -74.02, -74.03, -74.04]
-    }
-    df_mock = pd.DataFrame(data)
     executor = CodeExecutor()
 
-    # 2. 测试用例 A: 成功的绘图代码
-    print("\n[Test A] Valid Code Execution")
+    # 1. 创建模拟数据
+    data_a = {
+        "category": ["A", "B", "C"],
+        "value": [10, 20, 15]
+    }
+    df_mock = pd.DataFrame(data_a)
+
+    # 模拟多文件场景：创建第二个 DataFrame
+    data_b = {
+        "category": ["A", "B", "C"],
+        "info": ["Info1", "Info2", "Info3"]
+    }
+    df_info = pd.DataFrame(data_b)
+
+    # 2. 测试用例 A: 单变量兼容性测试
+    print("\n[Test A] Single Variable Execution")
     valid_code = """
-import plotly.express as px
-# 绘制柱状图
 fig = px.bar(df, x='category', y='value', title='Test Bar Chart')
     """
-    res_a = executor.execute(valid_code, df_mock)
+    # 注意：现在必须传入字典 {'df': df_mock}
+    res_a = executor.execute(valid_code, {"df": df_mock})
+
     if res_a.success:
         print("✅ Success! Got object type:", type(res_a.result))
-        # res_a.result.show() # 如果在本地运行，取消注释可以看到图
     else:
         print("❌ Failed:", res_a.error)
 
-    # 3. 测试用例 B: 错误的代码 (测试报错捕获)
+    # 3. 测试用例 B: 错误捕获
     print("\n[Test B] Broken Code Execution")
-    broken_code = """
-# 这是一个错误的列名 'values' (应该是 'value')
-fig = px.bar(df, x='category', y='values')
-    """
-    res_b = executor.execute(broken_code, df_mock)
+    broken_code = "fig = px.bar(df, x='category', y='wrong_column')"
+    res_b = executor.execute(broken_code, {"df": df_mock})
+
     if not res_b.success:
         print("✅ Correctly caught error!")
-        print("Error Snippet:", res_b.error.split('\n')[-2])  # 打印最后一行报错
     else:
-        print("❌ Should have failed but succeeded.")
+        print("❌ Should have failed.")
 
-    # 4. 测试用例 C: 忘记赋值给 fig
-    print("\n[Test C] Missing 'fig' variable")
-    no_fig_code = """
-chart = px.bar(df, x='category', y='value')
-# 忘记写 fig = chart
+    # 4. [新增] 测试用例 D: 多变量协同测试
+    print("\n[Test D] Multi-Variable Execution (Merge scenario)")
+
+    # 模拟 AI 生成的代码：使用两个变量 df_main 和 df_desc
+    multi_var_code = """
+# 模拟关联操作
+merged_df = pd.merge(df_main, df_desc, on='category')
+fig = px.bar(merged_df, x='category', y='value', hover_data=['info'], title='Merged Data Plot')
     """
-    res_c = executor.execute(no_fig_code, df_mock)
-    if not res_c.success and "no variable named 'fig'" in res_c.error:
-        print("✅ Correctly detected missing output variable.")
+
+    # 构造包含两个 DataFrame 的上下文
+    context = {
+        "df_main": df_mock,
+        "df_desc": df_info
+    }
+
+    res_d = executor.execute(multi_var_code, context)
+
+    if res_d.success:
+        print("✅ Multi-variable Execution Success!")
+        print(f"   Context used: {list(context.keys())}")
     else:
-        print("❌ Failed validation.")
+        print("❌ Multi-variable Failed:", res_d.error)

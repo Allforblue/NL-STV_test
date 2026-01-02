@@ -3,21 +3,20 @@ import pandas as pd
 import geopandas as gpd
 import os
 import sys
+import re
 from pathlib import Path
 import logging
 
 # --- 环境设置 ---
-# 将项目根目录加入路径，确保能导入 core 模块
 current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir))
 
-# 引入核心模块
 from core.ingestion.loader_factory import LoaderFactory
 from core.llm.ollama_client import LocalLlamaClient
 from core.profiler.semantic_analyzer import SemanticAnalyzer
 from core.generation.code_generator import CodeGenerator
 from core.execution.executor import CodeExecutor
-from core.generation.goal_explorer import GoalExplorer  # [新增] 目标探索器
+from core.generation.goal_explorer import GoalExplorer
 
 # 配置页面
 st.set_page_config(
@@ -28,275 +27,276 @@ st.set_page_config(
 )
 
 
-# --- 缓存资源 (单例模式) ---
+# --- 辅助工具：变量名清洗 ---
+def sanitize_var_name(filename):
+    """
+    将文件名转换为合法的 Python 变量名。
+    例如: 'taxi_zones.shp' -> 'df_taxi_zones'
+    """
+    # 移除扩展名
+    name = os.path.splitext(filename)[0]
+    # 替换非字母数字为下划线
+    clean_name = re.sub(r'[^a-zA-Z0-9]', '_', name)
+    # 避免数字开头, 且统一加 df_ 前缀
+    if clean_name[0].isdigit():
+        clean_name = "df_" + clean_name
+    elif not clean_name.startswith("df_"):
+        clean_name = "df_" + clean_name
+    return clean_name.lower()
+
+
+# --- 缓存资源 ---
 @st.cache_resource
 def get_core_modules():
-    """初始化所有核心组件，避免重复加载 LLM"""
     try:
-        # 统一使用同一个 LLM 客户端
         client = LocalLlamaClient(model_name="llama3.1:latest")
-
-        analyzer = SemanticAnalyzer(client)
-        generator = CodeGenerator(client)
-        executor = CodeExecutor()
-        explorer = GoalExplorer(client)
-
-        return analyzer, generator, executor, explorer
+        return (
+            SemanticAnalyzer(client),
+            CodeGenerator(client),
+            CodeExecutor(),
+            GoalExplorer(client)
+        )
     except Exception as e:
         st.error(f"核心组件初始化失败: {e}")
         return None, None, None, None
 
 
 @st.cache_data
-def load_data_for_analysis(file_path, use_full_data=False):
-    """
-    加载用于绘图的数据。
-    根据开关决定是全量加载还是采样加载。
-    """
+def load_data_snapshot(file_path, use_full_data=False):
+    """加载单个文件的数据"""
     loader = LoaderFactory.get_loader(file_path)
 
-    # Shapefile/GeoJSON 通常体积可控，总是全量加载以保证地图完整性
+    # 地理数据通常全量加载
     if file_path.endswith('.shp') or file_path.endswith('.geojson'):
         return loader.load(file_path)
 
     if use_full_data:
-        # 全量模式：适合统计分析，但前端渲染散点图可能会卡
         return loader.load(file_path)
     else:
-        # 极速模式：采样 50,000 行，适合快速探索和散点图预览
         return loader.peek(file_path, n=50000)
 
 
-# --- 辅助函数 ---
-def save_uploaded_file(uploaded_file):
+def save_uploaded_files(uploaded_files):
+    """保存所有上传的文件到 data_sandbox"""
     save_dir = "data_sandbox"
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
-    file_path = os.path.join(save_dir, uploaded_file.name)
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return file_path
+
+    saved_paths = []
+    for up_file in uploaded_files:
+        file_path = os.path.join(save_dir, up_file.name)
+        with open(file_path, "wb") as f:
+            f.write(up_file.getbuffer())
+        saved_paths.append(file_path)
+    return saved_paths
 
 
-# --- 主逻辑 ---
+def get_analyzable_files(file_paths):
+    """
+    筛选出主数据文件（排除 .dbf, .shx 等伴生文件）。
+    Shapefile 的读取依赖 .shp, 但我们只需要针对 .shp 发起加载指令。
+    """
+    valid_exts = ['.csv', '.parquet', '.shp', '.geojson', '.xlsx']
+    return [f for f in file_paths if os.path.splitext(f)[1].lower() in valid_exts]
+
+
+# --- 核心查询处理 (封装以便复用) ---
+def handle_query(query_text, summaries, generator, executor, data_context):
+    # 1. 记录用户消息
+    st.session_state.messages.append({"role": "user", "type": "text", "content": query_text})
+    with st.chat_message("user"):
+        st.markdown(query_text)
+
+    # 2. AI 处理
+    with st.chat_message("assistant"):
+        msg_holder = st.empty()
+        msg_holder.markdown("🤔 正在思考多表关联与绘图...")
+
+        try:
+            # A. 生成代码 (传入 summaries 列表)
+            code = generator.generate_code(query_text, summaries)
+
+            # B. 执行代码 (传入 data_context 字典)
+            msg_holder.markdown("⚡ 正在执行代码...")
+            res = executor.execute(code, data_context)
+
+            # C. 自愈机制
+            retries = 5
+            count = 0
+            while not res.success and count < retries:
+                count += 1
+                msg_holder.warning(f"⚠️ 代码报错，正在进行第 {count} 次自动修复...")
+                code = generator.fix_code(code, res.error, summaries)
+                res = executor.execute(code, data_context)
+
+            # D. 结果展示
+            if res.success:
+                st.plotly_chart(res.result, use_container_width=True)
+
+                msg_holder.markdown(f"✅ 生成成功！")
+                st.session_state.messages.append({"role": "assistant", "type": "plot", "content": res.result})
+                st.session_state.messages.append({"role": "assistant", "type": "code", "content": code})
+
+                with st.expander("查看生成代码"):
+                    st.code(code, language="python")
+            else:
+                err_msg = f"❌ 执行失败: \n```\n{res.error}\n```"
+                msg_holder.error(err_msg)
+                st.session_state.messages.append({"role": "assistant", "type": "text", "content": err_msg})
+                with st.expander("查看最后代码"):
+                    st.code(code, language="python")
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+
+# --- 主程序 ---
 def main():
-    st.title("🗺️ NL-STV: AI 驱动的时空数据分析平台")
+    st.title("🗺️ NL-STV: 多源数据协同分析")
 
-    # 1. 初始化组件
     analyzer, generator, executor, explorer = get_core_modules()
-    if not analyzer:
-        st.stop()
+    if not analyzer: st.stop()
 
-    # 2. 初始化 Session State
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "analysis_summary" not in st.session_state:
-        st.session_state.analysis_summary = None
-    if "suggested_goals" not in st.session_state:
-        st.session_state.suggested_goals = []
-    if "current_file" not in st.session_state:
-        st.session_state.current_file = None
-    if "last_use_full" not in st.session_state:
-        st.session_state.last_use_full = False
-    # 用于处理按钮点击触发聊天
-    if "prompt_trigger" not in st.session_state:
-        st.session_state.prompt_trigger = None
+    # Session State 初始化
+    if "messages" not in st.session_state: st.session_state.messages = []
+    # [修改点] 改为列表，存储多个 summary
+    if "data_summaries" not in st.session_state: st.session_state.data_summaries = []
+    if "uploaded_filenames" not in st.session_state: st.session_state.uploaded_filenames = []
+    if "suggested_goals" not in st.session_state: st.session_state.suggested_goals = []
+    if "prompt_trigger" not in st.session_state: st.session_state.prompt_trigger = None
+    if "last_use_full" not in st.session_state: st.session_state.last_use_full = False
 
-    # 3. 侧边栏：控制面板
+    # 侧边栏
     with st.sidebar:
-        st.header("📂 数据接入")
-        uploaded_file = st.file_uploader(
-            "上传数据文件 (CSV/Parquet/Shapefile)",
-            type=["csv", "parquet", "zip", "shp"]
+        st.header("📂 多文件接入")
+        # [修改点]: accept_multiple_files=True
+        uploaded_files = st.file_uploader(
+            "上传所有相关文件 (支持 .csv, .parquet, .shp 及伴生文件)",
+            type=["csv", "parquet", "zip", "shp", "dbf", "shx", "prj", "sbn", "sbx", "xml", "cpg"],
+            accept_multiple_files=True
         )
 
         st.markdown("---")
         st.header("⚙️ 设置")
-        use_full_data = st.toggle(
-            "🚀 启用全量数据模式",
-            value=False,
-            help="开启后加载所有数据。统计更准，但大量点的绘图可能变慢。"
-        )
-
+        use_full = st.toggle("🚀 全量模式", value=False)
         st.info(f"💡 AI 模型: Llama 3.1 (Local)")
 
-        # 重置逻辑：如果换了文件 OR 切换了模式，清空状态
-        file_changed = uploaded_file and uploaded_file.name != st.session_state.current_file
-        mode_changed = use_full_data != st.session_state.last_use_full
+        # 状态重置检测
+        current_names = sorted([f.name for f in uploaded_files]) if uploaded_files else []
+        file_changed = current_names != st.session_state.uploaded_filenames
+        mode_changed = use_full != st.session_state.last_use_full
 
         if file_changed or mode_changed:
-            st.session_state.current_file = uploaded_file.name if uploaded_file else None
-            st.session_state.last_use_full = use_full_data
-            st.session_state.analysis_summary = None
-            st.session_state.suggested_goals = []
+            st.session_state.uploaded_filenames = current_names
+            st.session_state.last_use_full = use_full
+            st.session_state.data_summaries = []
             st.session_state.messages = []
-            st.cache_data.clear()  # 清除旧的数据缓存
+            st.session_state.suggested_goals = []
+            st.cache_data.clear()
 
-    # 4. 核心流程
-    if uploaded_file:
-        file_path = save_uploaded_file(uploaded_file)
+    if uploaded_files:
+        # 1. 保存所有文件到沙箱 (Shapefile 需要所有伴生文件都在同一目录)
+        all_paths = save_uploaded_files(uploaded_files)
 
-        # --- Phase 1: 自动分析与目标生成 ---
-        if not st.session_state.analysis_summary:
-            with st.status("🔍 AI 正在阅读数据...", expanded=True) as status:
-                st.write("正在提取数据指纹与语义...")
-                summary = analyzer.analyze(file_path)
+        # 2. 筛选出主数据文件进行分析
+        analyzable_paths = get_analyzable_files(all_paths)
 
-                if "error" in summary:
-                    status.update(label="❌ 分析失败", state="error")
-                    st.error(summary["error"])
-                    st.stop()
+        if not analyzable_paths:
+            st.warning("已上传文件，但未检测到支持的主数据格式 (.csv, .parquet, .shp)。")
+            # 这里不 stop，防止用户只上传了辅助文件还没传完主文件时页面空白
+        else:
+            # 3. 逐个分析文件语义
+            if not st.session_state.data_summaries:
+                summaries = []
+                with st.status("🔍 正在解析多源数据...", expanded=True) as status:
+                    for path in analyzable_paths:
+                        fname = os.path.basename(path)
+                        st.write(f"正在分析: {fname} ...")
 
-                st.session_state.analysis_summary = summary
+                        # 分析语义
+                        summary = analyzer.analyze(path)
+                        if "error" not in summary:
+                            # [关键]: 为文件分配变量名
+                            var_name = sanitize_var_name(fname)
+                            summary['variable_name'] = var_name
+                            summaries.append(summary)
+                            st.write(f"✅ 已加载为变量: `{var_name}`")
+                        else:
+                            st.error(f"{fname} 分析失败: {summary['error']}")
 
-                st.write("💡 正在构思分析方向 (Goal Exploration)...")
-                goals = explorer.generate_goals(summary)
-                st.session_state.suggested_goals = goals
+                    st.session_state.data_summaries = summaries
 
-                status.update(label="✅ 数据感知完成", state="complete", expanded=False)
+                    # 基于第一个主文件生成推荐 (简化处理)
+                    if summaries:
+                        st.write("💡 生成分析建议...")
+                        st.session_state.suggested_goals = explorer.generate_goals(summaries[0])
 
-        # 展示数据摘要
-        summary = st.session_state.analysis_summary
-        with st.expander("📊 查看数据摘要与语义映射", expanded=False):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(f"**数据类型**: {summary['semantic_analysis'].get('dataset_type', 'N/A')}")
-                st.markdown(f"**总行数**: {summary['basic_stats']['rows']:,}")
-            with col2:
-                st.markdown(f"**AI 描述**: {summary['semantic_analysis'].get('description', 'N/A')}")
+                    status.update(label="✅ 所有文件加载完成", state="complete", expanded=False)
 
-            st.table(
-                pd.DataFrame(list(summary['semantic_analysis']['semantic_tags'].items()), columns=['列名', '语义标签']))
-
-        # --- Phase 2: 对话式绘图 ---
-        st.divider()
-        st.subheader("💬 AI 可视化助手")
-
-        # 4.1 推荐目标按钮 (Goal Explorer)
-        if st.session_state.suggested_goals:
-            st.caption("✨ 猜你想问：")
-            # 动态创建列
-            cols = st.columns(len(st.session_state.suggested_goals))
-            for i, goal in enumerate(st.session_state.suggested_goals):
-                if cols[i].button(goal, key=f"goal_btn_{i}", use_container_width=True):
-                    st.session_state.prompt_trigger = goal
-
-        # 4.2 聊天历史展示
-        for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]):
-                if msg["type"] == "text":
-                    st.markdown(msg["content"])
-                elif msg["type"] == "plot":
-                    st.plotly_chart(msg["content"], use_container_width=True)
-                elif msg["type"] == "code":
-                    with st.expander("查看生成的代码"):
-                        st.code(msg["content"], language="python")
-
-        # 4.3 输入处理逻辑
-        # 优先处理按钮点击，否则处理输入框
-        user_input = None
-        chat_input_val = st.chat_input("请输入指令，例如：'画出车费的分布' 或 '展示OD流向'")
-
-        if st.session_state.prompt_trigger:
-            user_input = st.session_state.prompt_trigger
-            st.session_state.prompt_trigger = None  # 消费掉触发器
-        elif chat_input_val:
-            user_input = chat_input_val
-
-        # 4.4 执行逻辑
-        if user_input:
-            # 显示用户消息
-            st.session_state.messages.append({"role": "user", "type": "text", "content": user_input})
-            with st.chat_message("user"):
-                st.markdown(user_input)
-
-            # AI 处理
-            with st.chat_message("assistant"):
-                message_placeholder = st.empty()
-                message_placeholder.markdown("🤔 正在思考绘图代码...")
-
-                # A. 加载数据上下文
+            # 4. 准备数据上下文 (加载所有 DataFrame)
+            data_context = {}
+            for summary in st.session_state.data_summaries:
+                path = summary['file_info']['path']
+                var_name = summary['variable_name']
+                # 加载数据到内存
                 try:
-                    df_context = load_data_for_analysis(file_path, use_full_data=use_full_data)
+                    df = load_data_snapshot(path, use_full_data=use_full)
+                    data_context[var_name] = df
                 except Exception as e:
-                    st.error(f"数据加载失败: {e}")
-                    st.stop()
+                    st.error(f"加载变量 {var_name} 失败: {e}")
 
-                # B. 代码生成与执行循环 (含自愈机制)
-                try:
-                    # 初次生成
-                    generated_code = generator.generate_code(user_input, summary)
+            # 5. UI 展示已加载变量
+            if st.session_state.data_summaries:
+                with st.expander("📊 已加载的数据集变量 (可在对话中直接使用)", expanded=True):
+                    for summary in st.session_state.data_summaries:
+                        desc = summary['semantic_analysis'].get('description', '无描述')
+                        st.markdown(f"**`{summary['variable_name']}`** ({summary['file_info']['name']})")
+                        st.caption(f"包含列: {', '.join(list(summary['basic_stats']['column_stats'].keys())[:5])}...")
 
-                    # 执行
-                    message_placeholder.markdown("⚡ 正在执行代码...")
-                    exec_result = executor.execute(generated_code, df_context)
+            # 6. 交互区域
+            st.divider()
+            st.subheader("💬 AI 可视化助手")
 
-                    # === 自愈机制 (Self-Healing Loop) ===
-                    max_retries = 2
-                    retry_count = 0
+            # 推荐按钮
+            if st.session_state.suggested_goals:
+                cols = st.columns(len(st.session_state.suggested_goals))
+                for i, goal in enumerate(st.session_state.suggested_goals):
+                    if cols[i].button(goal, key=f"btn_{i}"):
+                        st.session_state.prompt_trigger = goal
 
-                    while not exec_result.success and retry_count < max_retries:
-                        retry_count += 1
-                        message_placeholder.warning(f"⚠️ 代码报错，正在进行第 {retry_count} 次自动修复...")
+            # 历史记录
+            for msg in st.session_state.messages:
+                with st.chat_message(msg["role"]):
+                    if msg["type"] == "text":
+                        st.markdown(msg["content"])
+                    elif msg["type"] == "plot":
+                        st.plotly_chart(msg["content"], use_container_width=True)
+                    elif msg["type"] == "code":
+                        with st.expander("查看代码"):
+                            st.code(msg["content"], language="python")
 
-                        # 调用修复
-                        fixed_code = generator.fix_code(
-                            original_code=generated_code,
-                            error_trace=exec_result.error,
-                            context_summary=summary
-                        )
+            # 输入处理
+            user_input = None
+            if prompt := st.chat_input("请输入指令 (例如: '关联 df_trips 和 df_zones 并按区域统计订单量')"):
+                user_input = prompt
 
-                        # 重试执行
-                        generated_code = fixed_code
-                        exec_result = executor.execute(generated_code, df_context)
-                    # ===================================
+            if st.session_state.prompt_trigger:
+                user_input = st.session_state.prompt_trigger
+                st.session_state.prompt_trigger = None
 
-                    # 结果处理
-                    if exec_result.success:
-                        # 成功
-                        st.plotly_chart(exec_result.result, use_container_width=True)
-
-                        # 构建成功消息
-                        row_count = len(df_context)
-                        success_msg = f"✅ 图表生成成功！(基于 {row_count:,} 条数据)"
-                        if retry_count > 0:
-                            success_msg += f" | ✨ 自动修复了 {retry_count} 个错误。"
-
-                        message_placeholder.markdown(success_msg)
-
-                        # 保存历史
-                        st.session_state.messages.append(
-                            {"role": "assistant", "type": "plot", "content": exec_result.result})
-                        st.session_state.messages.append(
-                            {"role": "assistant", "type": "code", "content": generated_code})
-
-                        with st.expander("查看最终代码"):
-                            st.code(generated_code, language="python")
-                    else:
-                        # 失败 (重试后依然失败)
-                        error_msg = f"❌ 抱歉，我尝试了 {retry_count} 次修复但依然失败。\n\n**错误信息**: \n```\n{exec_result.error}\n```"
-                        message_placeholder.error(error_msg)
-                        st.session_state.messages.append({"role": "assistant", "type": "text", "content": error_msg})
-                        with st.expander("查看最后生成的代码"):
-                            st.code(generated_code, language="python")
-
-                except Exception as e:
-                    st.error(f"系统内部错误: {e}")
+            if user_input:
+                handle_query(user_input, st.session_state.data_summaries, generator, executor, data_context)
 
     else:
-        # Landing Page
         st.markdown("""
-        ### 👋 欢迎使用 NL-STV 时空分析平台
+        ### 👋 欢迎使用 NL-STV 多源数据分析平台
 
-        这是一个基于 LLM 的智能数据可视化工具。它能够理解您的数据语义，并根据自然语言指令自动编写 Python 代码绘图。
+        请在左侧上传您的数据文件。
 
-        **功能亮点：**
-        - 🧠 **语义感知**: 自动识别时间、坐标、业务指标。
-        - 🗣️ **对话绘图**: 说出您的需求，自动生成 Plotly 交互式图表。
-        - 🛠️ **自动自愈**: 代码报错？AI 会自己 Debug 并重试。
-        - 💡 **目标推荐**: 不知道问什么？AI 会主动给您推荐分析方向。
-
-        **请在左侧上传数据文件开始体验 (支持 CSV, Parquet, Shapefile)。**
+        **💡 提示：**
+        - **多文件上传**: 支持同时拖入多个文件（如订单表 + 区域 Shapefile）。
+        - **Shapefile**: 请务必同时上传 `.shp` 及其依赖文件 (`.dbf`, `.shx`, `.prj`)。
+        - **变量映射**: 上传后，系统会自动为每个文件分配变量名（如 `df_trips`），AI 能够识别并关联它们。
         """)
 
 
