@@ -8,7 +8,7 @@ from typing import Dict, Any
 # 注意：如果运行时提示 ModuleNotFoundError，请确保在项目根目录下运行，或设置 PYTHONPATH
 try:
     from core.ingestion.loader_factory import LoaderFactory
-    from core.llm.ollama_client import LocalLlamaClient
+    from core.llm.AI_client import AIClient
     from core.profiler.basic_stats import get_dataset_fingerprint
 except ImportError:
     # 兼容直接运行此脚本时的路径问题
@@ -16,19 +16,19 @@ except ImportError:
 
     sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
     from core.ingestion.loader_factory import LoaderFactory
-    from core.llm.ollama_client import LocalLlamaClient
+    from core.llm.AI_client import AIClient
     from core.profiler.basic_stats import get_dataset_fingerprint
 
 logger = logging.getLogger(__name__)
 
 
 class SemanticAnalyzer:
-    def __init__(self, llm_client: LocalLlamaClient):
+    def __init__(self, llm_client: AIClient):
         self.llm = llm_client
 
     def _build_prompt(self, filename: str, fingerprint: Dict[str, Any]) -> str:
         """
-        构建发送给 Llama 3.1 的 Prompt (经过幻觉抑制优化)。
+        构建发送给 model的 Prompt (经过幻觉抑制优化)。
         """
         # 1. 构建列的详细描述清单
         columns_summary = []
@@ -134,7 +134,7 @@ class SemanticAnalyzer:
 
         # 5. 调用 LLM 获取语义标签
         try:
-            print(f"   >>> Sending metadata of [{filename}] to Llama 3.1...")
+            print(f"   >>> Sending metadata of [{filename}] to model...")
             ai_result = self.llm.query_json(
                 prompt=prompt,
                 system_prompt="You are a data analysis assistant that outputs only valid JSON."
@@ -185,12 +185,12 @@ if __name__ == "__main__":
         exit()
 
     # 3. 初始化 AI 客户端
-    print("🔌 Connecting to Local Ollama...")
+    print("🔌 Connecting to Local model...")
     try:
-        client = LocalLlamaClient(model_name="llama3.1:latest")
+        client = AIClient(model_name="deepseek-chat")
         analyzer = SemanticAnalyzer(client)
     except Exception as e:
-        print(f"❌ Failed to init Ollama: {e}")
+        print(f"❌ Failed to init model: {e}")
         exit()
 
     # 4. 遍历文件进行分析

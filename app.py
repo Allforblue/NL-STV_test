@@ -8,15 +8,17 @@ from pathlib import Path
 import logging
 
 # --- 环境设置 ---
+# 将项目根目录加入路径，确保能导入 core 模块
 current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir))
 
 from core.ingestion.loader_factory import LoaderFactory
-from core.llm.ollama_client import LocalLlamaClient
+from core.llm.AI_client import AIClient  # 确保使用的是支持 DeepSeek 的 Client
 from core.profiler.semantic_analyzer import SemanticAnalyzer
 from core.generation.code_generator import CodeGenerator
 from core.execution.executor import CodeExecutor
 from core.generation.goal_explorer import GoalExplorer
+from core.generation.viz_editor import VizEditor  # [新增] 导入编辑器
 
 # 配置页面
 st.set_page_config(
@@ -49,16 +51,20 @@ def sanitize_var_name(filename):
 @st.cache_resource
 def get_core_modules():
     try:
-        client = LocalLlamaClient(model_name="llama3.1:latest")
+        # 这里使用 DeepSeek 模型
+        client = AIClient(
+            model_name="deepseek-chat"
+        )
         return (
             SemanticAnalyzer(client),
             CodeGenerator(client),
             CodeExecutor(),
-            GoalExplorer(client)
+            GoalExplorer(client),
+            VizEditor(client)  # [新增] 返回编辑器
         )
     except Exception as e:
         st.error(f"核心组件初始化失败: {e}")
-        return None, None, None, None
+        return None, None, None, None, None
 
 
 @st.cache_data
@@ -94,14 +100,20 @@ def save_uploaded_files(uploaded_files):
 def get_analyzable_files(file_paths):
     """
     筛选出主数据文件（排除 .dbf, .shx 等伴生文件）。
-    Shapefile 的读取依赖 .shp, 但我们只需要针对 .shp 发起加载指令。
     """
     valid_exts = ['.csv', '.parquet', '.shp', '.geojson', '.xlsx']
     return [f for f in file_paths if os.path.splitext(f)[1].lower() in valid_exts]
 
 
-# --- 核心查询处理 (封装以便复用) ---
-def handle_query(query_text, summaries, generator, executor, data_context):
+# --- 核心查询处理 (统一入口) ---
+def handle_query(query_text, summaries, modules, data_context, force_new=False):
+    """
+    处理查询逻辑：区分 生成新图(Generate) 和 修改旧图(Edit)
+    modules: (generator, executor, editor)
+    """
+    # 解包模块
+    generator, executor, editor = modules
+
     # 1. 记录用户消息
     st.session_state.messages.append({"role": "user", "type": "text", "content": query_text})
     with st.chat_message("user"):
@@ -110,18 +122,28 @@ def handle_query(query_text, summaries, generator, executor, data_context):
     # 2. AI 处理
     with st.chat_message("assistant"):
         msg_holder = st.empty()
-        msg_holder.markdown("🤔 正在思考多表关联与绘图...")
 
         try:
-            # A. 生成代码 (传入 summaries 列表)
-            code = generator.generate_code(query_text, summaries)
+            # === 逻辑分流: 编辑 vs 生成 ===
+            # 如果存在上下文代码，且用户没有强制开启“新图表模式”，则进入编辑模式
+            if st.session_state.last_generated_code and not force_new:
+                msg_holder.markdown("🎨 正在基于现有图表进行修改 (Editing)...")
+                code = editor.edit_code(
+                    original_code=st.session_state.last_generated_code,
+                    query=query_text,
+                    summaries=summaries
+                )
+            else:
+                msg_holder.markdown("🤔 正在构思新图表 (Generating)...")
+                code = generator.generate_code(query_text, summaries)
 
-            # B. 执行代码 (传入 data_context 字典)
+            # === 执行代码 ===
             msg_holder.markdown("⚡ 正在执行代码...")
             res = executor.execute(code, data_context)
 
-            # C. 自愈机制
-            retries = 5
+            # === 自愈机制 (Self-Healing) ===
+            # 这里复用 generator 的 fix_code，因为它包含最全的 GIS 规则库
+            retries = 3
             count = 0
             while not res.success and count < retries:
                 count += 1
@@ -129,16 +151,18 @@ def handle_query(query_text, summaries, generator, executor, data_context):
                 code = generator.fix_code(code, res.error, summaries)
                 res = executor.execute(code, data_context)
 
-            # D. 结果展示
+            # === 结果展示 ===
             if res.success:
-                st.plotly_chart(res.result, use_container_width=True)
+                # [关键] 更新上下文代码
+                st.session_state.last_generated_code = code
 
-                msg_holder.markdown(f"✅ 生成成功！")
+                # 保存到历史记录
                 st.session_state.messages.append({"role": "assistant", "type": "plot", "content": res.result})
                 st.session_state.messages.append({"role": "assistant", "type": "code", "content": code})
 
-                with st.expander("查看生成代码"):
-                    st.code(code, language="python")
+                # [核心修复] 强制页面重绘，确保按钮区能立刻检测到 last_generated_code 并显示出来
+                st.rerun()
+
             else:
                 err_msg = f"❌ 执行失败: \n```\n{res.error}\n```"
                 msg_holder.error(err_msg)
@@ -147,29 +171,35 @@ def handle_query(query_text, summaries, generator, executor, data_context):
                     st.code(code, language="python")
 
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"System Error: {e}")
 
 
 # --- 主程序 ---
 def main():
-    st.title("🗺️ NL-STV: 多源数据协同分析")
+    st.title("🗺️ NL-STV: 交互式时空分析平台")
 
-    analyzer, generator, executor, explorer = get_core_modules()
+    # 1. 初始化模块
+    analyzer, generator, executor, explorer, editor = get_core_modules()
     if not analyzer: st.stop()
+
+    # 打包 modules 方便传递
+    modules_pack = (generator, executor, editor)
 
     # Session State 初始化
     if "messages" not in st.session_state: st.session_state.messages = []
-    # [修改点] 改为列表，存储多个 summary
     if "data_summaries" not in st.session_state: st.session_state.data_summaries = []
     if "uploaded_filenames" not in st.session_state: st.session_state.uploaded_filenames = []
     if "suggested_goals" not in st.session_state: st.session_state.suggested_goals = []
     if "prompt_trigger" not in st.session_state: st.session_state.prompt_trigger = None
     if "last_use_full" not in st.session_state: st.session_state.last_use_full = False
 
+    # 上下文状态
+    if "last_generated_code" not in st.session_state: st.session_state.last_generated_code = None
+    if "last_query" not in st.session_state: st.session_state.last_query = None
+
     # 侧边栏
     with st.sidebar:
         st.header("📂 多文件接入")
-        # [修改点]: accept_multiple_files=True
         uploaded_files = st.file_uploader(
             "上传所有相关文件 (支持 .csv, .parquet, .shp 及伴生文件)",
             type=["csv", "parquet", "zip", "shp", "dbf", "shx", "prj", "sbn", "sbx", "xml", "cpg"],
@@ -179,7 +209,7 @@ def main():
         st.markdown("---")
         st.header("⚙️ 设置")
         use_full = st.toggle("🚀 全量模式", value=False)
-        st.info(f"💡 AI 模型: Llama 3.1 (Local)")
+        st.info(f"💡 AI 模型: DeepSeek-V3")
 
         # 状态重置检测
         current_names = sorted([f.name for f in uploaded_files]) if uploaded_files else []
@@ -192,20 +222,19 @@ def main():
             st.session_state.data_summaries = []
             st.session_state.messages = []
             st.session_state.suggested_goals = []
+            st.session_state.last_generated_code = None
+            st.session_state.last_query = None
             st.cache_data.clear()
 
     if uploaded_files:
-        # 1. 保存所有文件到沙箱 (Shapefile 需要所有伴生文件都在同一目录)
+        # 1. 保存与筛选
         all_paths = save_uploaded_files(uploaded_files)
-
-        # 2. 筛选出主数据文件进行分析
         analyzable_paths = get_analyzable_files(all_paths)
 
         if not analyzable_paths:
             st.warning("已上传文件，但未检测到支持的主数据格式 (.csv, .parquet, .shp)。")
-            # 这里不 stop，防止用户只上传了辅助文件还没传完主文件时页面空白
         else:
-            # 3. 逐个分析文件语义
+            # 2. 分析语义
             if not st.session_state.data_summaries:
                 summaries = []
                 with st.status("🔍 正在解析多源数据...", expanded=True) as status:
@@ -213,10 +242,8 @@ def main():
                         fname = os.path.basename(path)
                         st.write(f"正在分析: {fname} ...")
 
-                        # 分析语义
                         summary = analyzer.analyze(path)
                         if "error" not in summary:
-                            # [关键]: 为文件分配变量名
                             var_name = sanitize_var_name(fname)
                             summary['variable_name'] = var_name
                             summaries.append(summary)
@@ -226,45 +253,42 @@ def main():
 
                     st.session_state.data_summaries = summaries
 
-                    # 基于第一个主文件生成推荐 (简化处理)
                     if summaries:
                         st.write("💡 生成分析建议...")
                         st.session_state.suggested_goals = explorer.generate_goals(summaries[0])
 
                     status.update(label="✅ 所有文件加载完成", state="complete", expanded=False)
 
-            # 4. 准备数据上下文 (加载所有 DataFrame)
+            # 3. 准备数据上下文
             data_context = {}
             for summary in st.session_state.data_summaries:
                 path = summary['file_info']['path']
                 var_name = summary['variable_name']
-                # 加载数据到内存
                 try:
                     df = load_data_snapshot(path, use_full_data=use_full)
                     data_context[var_name] = df
                 except Exception as e:
                     st.error(f"加载变量 {var_name} 失败: {e}")
 
-            # 5. UI 展示已加载变量
+            # 4. UI 展示
             if st.session_state.data_summaries:
                 with st.expander("📊 已加载的数据集变量 (可在对话中直接使用)", expanded=True):
                     for summary in st.session_state.data_summaries:
-                        desc = summary['semantic_analysis'].get('description', '无描述')
                         st.markdown(f"**`{summary['variable_name']}`** ({summary['file_info']['name']})")
                         st.caption(f"包含列: {', '.join(list(summary['basic_stats']['column_stats'].keys())[:5])}...")
 
-            # 6. 交互区域
+            # 5. 交互区域
             st.divider()
             st.subheader("💬 AI 可视化助手")
 
-            # 推荐按钮
+            # A. 推荐按钮
             if st.session_state.suggested_goals:
                 cols = st.columns(len(st.session_state.suggested_goals))
                 for i, goal in enumerate(st.session_state.suggested_goals):
                     if cols[i].button(goal, key=f"btn_{i}"):
                         st.session_state.prompt_trigger = goal
 
-            # 历史记录
+            # B. 历史记录 (这里会显示成功后的图表)
             for msg in st.session_state.messages:
                 with st.chat_message(msg["role"]):
                     if msg["type"] == "text":
@@ -275,17 +299,42 @@ def main():
                         with st.expander("查看代码"):
                             st.code(msg["content"], language="python")
 
-            # 输入处理
-            user_input = None
-            if prompt := st.chat_input("请输入指令 (例如: '关联 df_trips 和 df_zones 并按区域统计订单量')"):
-                user_input = prompt
+            # --- 输入与控制区 ---
+            col_tools = st.columns([1, 1.5, 5])
+            trigger_query = None
+            force_new_toggle = False
 
+            # C. 重新生成按钮
+            if st.session_state.last_query:
+                if col_tools[0].button("🔄 重新生成", help="重试上一次指令"):
+                    trigger_query = st.session_state.last_query
+
+            # D. 新图表模式开关 (仅当有上下文时显示)
+            if st.session_state.last_generated_code:
+                with col_tools[1]:
+                    force_new_toggle = st.toggle(
+                        "🆕 新图表模式",
+                        value=False,
+                        help="开启后将忽略当前图表，根据指令重新生成新图。"
+                    )
+
+            # E. 输入框
+            chat_input_val = st.chat_input("输入指令 (例如 '把颜色改成红色' 或 '关联表A和表B')")
+
+            # 优先级判断
             if st.session_state.prompt_trigger:
-                user_input = st.session_state.prompt_trigger
+                trigger_query = st.session_state.prompt_trigger
                 st.session_state.prompt_trigger = None
+                force_new_toggle = True  # 点击推荐问题通常意味着想要新图
+            elif chat_input_val:
+                trigger_query = chat_input_val
 
-            if user_input:
-                handle_query(user_input, st.session_state.data_summaries, generator, executor, data_context)
+            # 执行处理
+            if trigger_query:
+                st.session_state.last_query = trigger_query
+                # 传递所有模块包
+                handle_query(trigger_query, st.session_state.data_summaries, modules_pack, data_context,
+                             force_new=force_new_toggle)
 
     else:
         st.markdown("""
@@ -294,9 +343,9 @@ def main():
         请在左侧上传您的数据文件。
 
         **💡 提示：**
-        - **多文件上传**: 支持同时拖入多个文件（如订单表 + 区域 Shapefile）。
-        - **Shapefile**: 请务必同时上传 `.shp` 及其依赖文件 (`.dbf`, `.shx`, `.prj`)。
-        - **变量映射**: 上传后，系统会自动为每个文件分配变量名（如 `df_trips`），AI 能够识别并关联它们。
+        - **多文件**: 支持同时上传多个文件（如业务数据 + 区域 Shapefile）。
+        - **Shapefile**: 请务必上传 `.shp` 及其依赖文件 (`.dbf`, `.shx`)。
+        - **交互**: 支持基于当前图表进行多轮对话修改（如 "把图例去掉"）。
         """)
 
 
