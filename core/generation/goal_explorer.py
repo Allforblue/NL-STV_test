@@ -1,13 +1,13 @@
 import logging
 import json
 from typing import Dict, Any, List
-from core.llm.ollama_client import LocalLlamaClient
+from core.llm.AI_client import AIClient
 
 logger = logging.getLogger(__name__)
 
 
 class GoalExplorer:
-    def __init__(self, llm_client: LocalLlamaClient):
+    def __init__(self, llm_client: AIClient):
         self.llm = llm_client
 
     def generate_goals(self, summary: Dict[str, Any], n: int = 4) -> List[str]:
@@ -85,7 +85,7 @@ if __name__ == "__main__":
         }
     }
 
-    client = LocalLlamaClient()
+    client = AIClient()
     explorer = GoalExplorer(client)
     goals = explorer.generate_goals(mock_summary)
     print("Suggested Goals:", goals)
